@@ -337,27 +337,20 @@ func TestARunningSessionIsResumedThroughTheSharedRunPath(t *testing.T) {
 	// Released in a cleanup registered AFTER startServer, and then WAITED for.
 	//
 	// The order is the whole fix. Cleanups run last-registered-first, so a cleanup
-	// registered before startServer runs after srv.Close - and that is too late to be
-	// useful here: this task blocks on release and IGNORES its context, so closing the
-	// server does not end it. Releasing it that late left the run's goroutine to finish
-	// on its own schedule, and its deferred saveSession writes into the sessions
-	// directory while t.TempDir's cleanup is removing it - which failed about one run in
-	// twenty under load with "RemoveAll cleanup: directory not empty".
+	// registered before startServer runs after srv.Close AND after t.TempDir's
+	// RemoveAll - and that is too late to be useful here: this task blocks on release
+	// and IGNORES its context, so closing the server does not end it. Releasing it that
+	// late left the run's goroutine to finish on its own schedule, and its deferred
+	// saveSession writes into the sessions directory while t.TempDir's cleanup is
+	// removing it - which failed about one run in twenty under load with
+	// "RemoveAll cleanup: directory not empty".
 	//
-	// Waiting for the conversation to stop running is what removes the race: isRunning
-	// is false only after releaseRunSlot, which is the run goroutine's last defer, so by
-	// the time this returns the write has already happened and the directory is quiet.
+	// Waiting is the other half, and the shared helper does it: isRunning is false only
+	// after releaseRunSlot, the run goroutine's last defer, so by the time this returns
+	// the write has already happened and every temp dir is quiet.
 	t.Cleanup(func() {
 		close(release)
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			conv, ok := srv.lookup("s-interrupted")
-			if !ok || !conv.isRunning() {
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-		t.Error("the resumed run never finished, so its writer can still race the temp dir")
+		waitForNoRun(t, srv)
 	})
 
 	if _, ok := srv.lookup("s-interrupted"); !ok {
