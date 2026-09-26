@@ -16,6 +16,21 @@ import (
 	"github.com/madkoding/motita/internal/gitx"
 )
 
+// deleteStopTimeout is how long a deletion waits for a cancelled run to finish
+// unwinding before giving up and reporting it.
+//
+// It is a var rather than a const so a test can set it small: reaching the timeout
+// with the real value would mean a ten-second test, and the branch would go
+// unexercised. The repository already uses this shape for its other seams
+// (launchCommand, listenAndServe).
+//
+// Generous on purpose: the wait is normally milliseconds, because the cancellation
+// kills the sandbox's whole process group and there is no command left to wait for.
+// Ten seconds is long enough that a slow-but-honest unwind is never mistaken for a
+// stuck one, and short enough that a user pressing Delete is not left staring at a
+// request that never returns.
+var deleteStopTimeout = 10 * time.Second
+
 // DefaultSession is the conversation every gateway has, and the one an embedded client uses.
 //
 // It exists because the common case is one conversation, not zero: the terminal that started this
@@ -240,6 +255,35 @@ func (c *conversation) cancelRun() bool {
 	}
 	rn.cancel()
 	return true
+}
+
+// stopRunForDeletion stops the run in flight and waits for the goroutine to
+// finish, so that by the time this returns nothing is still executing on behalf
+// of this conversation and nothing will write to it again.
+//
+// A plain cancellation is not enough for a DELETION. Cancelling only asks the run
+// to stop: the goroutine then unwinds from wherever it was - killing the sandbox
+// process group, appending its final events, running maybeAutoTitle, and reaching
+// saveSession - and deleting underneath that leaves a conversation being torn
+// down while a turn is still writing to it. Waiting for the run's own done channel
+// is what makes "stop it and then delete it" true rather than two races that
+// usually happen to be ordered.
+//
+// It reports whether there was a run to stop. The wait is bounded: a run that
+// ignores its cancellation for longer than this is reported as stopped-on-paper
+// rather than blocking the request forever, and the caller decides what to say.
+func (c *conversation) stopRunForDeletion(timeout time.Duration) (bool, bool) {
+	rn, ok := c.currentRun()
+	if !ok {
+		return false, true
+	}
+	rn.cancel()
+	select {
+	case <-rn.done:
+		return true, true
+	case <-time.After(timeout):
+		return true, false
+	}
 }
 
 // SessionStatus is what the list and create endpoints report about one conversation.
@@ -644,24 +688,28 @@ func (s *Server) handleListSessions(w http.ResponseWriter, _ *http.Request) {
 // "delete" on it expects.
 func (s *Server) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	c := convOf(r)
+	// A run in flight is STOPPED, not refused. Deleting a conversation is a
+	// decision about that conversation, and the old answer - a 409 telling the
+	// user to come back after the run finishes - made the decision conditional on
+	// a turn that may run for minutes, with no way to end it from here.
+	//
+	// The two halves have to be in this order and both have to happen: the
+	// cancellation kills what the agent is RUNNING (the sandbox process group, a
+	// pending approval, the model call), and the wait makes sure the goroutine
+	// has finished unwinding - it still appends its final events, generates an
+	// auto-title and saves the session - before the conversation is forgotten and
+	// its file removed. Deleting first would leave a turn writing into a session
+	// that no longer exists.
+	if stopped, settled := c.stopRunForDeletion(deleteStopTimeout); stopped && !settled {
+		writeError(w, http.StatusConflict,
+			"the run in this session did not stop in time, so the session was not deleted: stop it and try again")
+		return
+	}
 	if c.id == DefaultSession {
-		if c.isRunning() {
-			writeError(w, http.StatusConflict,
-				"a run is in progress in this session: close it after the run finishes")
-			return
-		}
 		c.svc.ResetConversation()
 		c.setTitle(placeholderTitle)
 		s.deletePersistedSession(c.id)
 		writeJSON(w, http.StatusOK, c.status())
-		return
-	}
-	// A run in flight is refused rather than killed: there is no cancel path in this design, and
-	// reporting a closed session while its run is still writing would be a lie about what is
-	// happening.
-	if c.isRunning() {
-		writeError(w, http.StatusConflict,
-			"a run is in progress in this session: close it after the run finishes")
 		return
 	}
 	// No "was it there?" branch: withConversation already proved it is, and a concurrent second

@@ -869,8 +869,18 @@ func (s *Server) resumeInterruptedSessions() {
 // saveSession persists one conversation to disk. It is called after a turn
 // finishes, after a rename, and after a config update. A nil store means
 // persistence is not configured, and the call is a no-op.
+//
+// A session that has been forgotten — removed from the registry by a DELETE —
+// is NOT saved. A run's goroutine holds a pointer to the conversation and its
+// deferred saveSession (runs.go) can fire AFTER handleDeleteSession has already
+// forgotten the session and deleted its file; without this guard, that late
+// save would resurrect the session on disk and it would reappear on the next
+// loadPersistedSessions.
 func (s *Server) saveSession(c *conversation) {
 	if s.store == nil {
+		return
+	}
+	if _, ok := s.lookup(c.id); !ok {
 		return
 	}
 	if err := s.store.save(c); err != nil && s.opts.Log != nil {

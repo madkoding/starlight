@@ -99,6 +99,57 @@ func TestOpenAIEmptyChoices(t *testing.T) {
 	}
 }
 
+// TestOpenAIEmptyContentIsRetryable: a 200 OK with a choice whose content is
+// the empty string must be an error, not a silent success that propagates ""
+// to ExtractJSON. This is the root cause of "the LLM response is empty".
+func TestOpenAIEmptyContentIsRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":""},"finish_reason":"length"}]}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	_, err := c.Complete(context.Background(), []Message{{Role: "user", Content: "hi"}})
+	if err == nil {
+		t.Fatal("an empty content must be an error, not a silent success")
+	}
+	if !strings.Contains(err.Error(), "empty response") {
+		t.Errorf("error should mention the empty response, got: %v", err)
+	}
+}
+
+// TestOpenAIEmptyContentToolsIsRetryable: same guard for the tools path —
+// empty content AND no tool calls must be an error.
+func TestOpenAIEmptyContentToolsIsRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"","tool_calls":null},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	_, err := c.CompleteTools(context.Background(), []Message{{Role: "user", Content: "hi"}}, nil)
+	if err == nil {
+		t.Fatal("empty content with no tool calls must be an error")
+	}
+	if !strings.Contains(err.Error(), "empty response") {
+		t.Errorf("error should mention the empty response, got: %v", err)
+	}
+}
+
+// TestOpenAIWhitespaceOnlyContentIsRetryable: whitespace-only content is just
+// as useless as empty content and must be treated the same way.
+func TestOpenAIWhitespaceOnlyContentIsRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"choices":[{"message":{"content":"   \n  "},"finish_reason":"stop"}]}`)
+	}))
+	defer srv.Close()
+
+	c := newTestClient(t, srv.URL)
+	if _, err := c.Complete(context.Background(), []Message{{Role: "user", Content: "hi"}}); err == nil {
+		t.Fatal("whitespace-only content must be an error")
+	}
+}
+
 func TestOpenAIErrorInBody(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, `{"error":{"message":"quota exceeded"}}`)

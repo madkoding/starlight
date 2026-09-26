@@ -537,6 +537,36 @@ func TestResumeInterruptedSessionsWithoutStore(t *testing.T) {
 	srv.resumeInterruptedSessions()
 }
 
+// TestSaveSessionSkipsForgottenConversation proves the guard in saveSession:
+// a run's goroutine holds a pointer to the conversation and its deferred
+// saveSession can fire AFTER handleDeleteSession has forgotten the session
+// and deleted its file. Without the guard, that late save would resurrect
+// the session on disk.
+func TestSaveSessionSkipsForgottenConversation(t *testing.T) {
+	sdir := t.TempDir()
+	srv := newTestServer(t, &fakeService{}, func(o *Options) {
+		o.SessionDir = sdir
+	})
+	// Register a conversation in the registry so saveSession's lookup finds it.
+	c := newConversation("s-test-forgotten", &fakeService{})
+	srv.sessionsMu.Lock()
+	srv.sessions[c.id] = c
+	srv.sessionsMu.Unlock()
+
+	srv.saveSession(c) // must write the file
+	if _, err := os.Stat(filepath.Join(sdir, "s-test-forgotten.json")); err != nil {
+		t.Fatalf("the first save should have written the file: %v", err)
+	}
+	// Delete the file and forget the session, as handleDeleteSession does.
+	srv.forget(c.id)
+	os.Remove(filepath.Join(sdir, "s-test-forgotten.json"))
+
+	srv.saveSession(c) // must NOT re-create the file
+	if _, err := os.Stat(filepath.Join(sdir, "s-test-forgotten.json")); !os.IsNotExist(err) {
+		t.Errorf("a forgotten session must not be re-saved: file exists after saveSession")
+	}
+}
+
 // --- setProjectID on conversation ---
 
 func TestConversationSetProjectID(t *testing.T) {

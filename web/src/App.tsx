@@ -529,9 +529,72 @@ export default function App() {
     return () => clearTimeout(t)
   }, [toast])
 
-  const setRunningState = (r: boolean) => {
+  // runSessionRef is the conversation the run in flight was started in. A run
+  // belongs to its SESSION, not to the tab, and the user is free to walk away
+  // from it: without pinning the id, an answer arriving after a session switch
+  // would clear the flag on whichever conversation happened to be on screen -
+  // leaving the one that actually finished looking busy and the one that is
+  // idle looking busy too.
+  const runSessionRef = useRef('')
+
+  // answeredRef is the conversation whose answer THIS TAB has already seen but
+  // whose run the gateway still reports as in flight.
+  //
+  // The gateway is telling the TRUTH in that window: the turn's goroutine has
+  // not returned yet. It generates the auto-title and saves the session BEFORE
+  // its deferred releaseRunSlot, and that ordering is deliberate - the gateway's
+  // own end-to-end test depends on the slot still being held at that point. So
+  // a list read taken in that window really does say a run is in flight, and
+  // the refresh that finish() issues (to pick up the new title) is exactly such
+  // a read: it turned the spinner back ON over a conversation that had already
+  // answered, for as long as the title took to generate.
+  //
+  // The row is masked for that session until the gateway's OWN flag goes false,
+  // which is why this is not a timer: the release happens at a moment only the
+  // gateway knows, and a fixed expiry would either un-mask too early (the
+  // spinner flashes back) or too late. A new run cannot start in that
+  // conversation before the release - the slot is what refuses it - so masking
+  // until then can never hide real work.
+  //
+  // The mask is applied when RENDERING, never to the stored list: the gateway's
+  // answer is kept verbatim so `anyRunning` below still counts it, and the poll
+  // therefore keeps running exactly long enough to observe the release and
+  // clear this.
+  const answeredRef = useRef('')
+  // answeredUntil is the backstop for a release that is never observed (a lost
+  // fetch, a gateway that went away). Comfortably past the title generator's
+  // own 15s ceiling, so it can only fire when something has genuinely gone
+  // wrong - and then it un-masks rather than leaving a row dark forever.
+  const answeredUntil = useRef(0)
+  const answeredHere = (id: string) => answeredRef.current === id && Date.now() < answeredUntil.current
+
+  const setRunningState = (r: boolean, sessionFor = sessionRef.current) => {
     runningRef.current = r
     setRunning(r)
+    // Fold this tab's own run into the SESSION LIST, so the row that owns it
+    // paints its spinner from the same field as every other row.
+    //
+    // Both directions matter, and the list alone cannot carry either one in
+    // time:
+    //
+    //   * true, at the instant the user sends - the gateway has not answered a
+    //     single /v1/sessions yet, and polling would leave the spinner off for
+    //     up to a tick while a turn is visibly running. It also clears any
+    //     latch, because a new turn supersedes the old answer.
+    //   * false, the moment the answer arrives, which LATCHES the session so
+    //     the refresh finish() issues cannot light it back up.
+    //
+    // setSessions is used and not fetchSessions: the local answer is
+    // authoritative in both directions, and a request issued here would be the
+    // stale one it exists to correct.
+    setSessions(prev => prev.map(s => s.id === sessionFor ? { ...s, running: r } : s))
+    if (r) {
+      answeredRef.current = ''
+      answeredUntil.current = 0
+    } else {
+      answeredRef.current = sessionFor
+      answeredUntil.current = Date.now() + 30000
+    }
   }
 
   const setState = (text: string, bad = false) => {
@@ -569,19 +632,49 @@ export default function App() {
       const data = await res.json()
       const list: SessionInfo[] = data.sessions || []
       setSessions(list)
+      // The gateway has now been asked, and it has answered. If it says the
+      // conversation whose answer we already have is NOT running, the run slot
+      // has been released - so the latch that was masking it has done its job
+      // and is cleared HERE, on the gateway's own word, rather than on a timer.
+      // (A stale read in the window is harmless by construction: it leaves the
+      // latch exactly as it was.)
+      if (answeredRef.current && !list.some(s => s.id === answeredRef.current && s.running)) {
+        answeredRef.current = ''
+        answeredUntil.current = 0
+      }
       return list
     } catch {
       return []
     }
   }, [])
 
-  // Poll session list while a run is in flight so the sidebar shows
-  // spinners on the sessions the agent is working on.
+  // Poll session list while a run is in flight, so the sidebar shows a
+  // spinner on whichever conversations the agent is working in.
+  //
+  // Two rules, and the earlier version got both wrong:
+  //
+  //  1. It polls while ANY conversation is running, not only the one this tab
+  //     started. A run belongs to the SESSION, not to a connection: another
+  //     client, a scheduled task, or a session resumed after a gateway restart
+  //     can be the one working, and a list this tab never refreshed would show
+  //     no sign of it.
+  //
+  //  2. It does NOT stop the instant this tab's own run ends. The gateway
+  //     appends the `done` event and finishes the run BEFORE its deferred
+  //     releaseRunSlot runs, so a list read taken right after the answer can
+  //     still report `running: true`. That read used to be the last one - the
+  //     interval was torn down in the same render, because it was keyed on the
+  //     local run alone - and the result was a spinner left turning on a
+  //     conversation that had already answered. Keying the interval on "is
+  //     anything running" makes that final, stale read harmless: it is no
+  //     longer the last one, and the next tick clears the flag the gateway has
+  //     by then released.
+  const anyRunning = sessions.some(s => s.running)
   useEffect(() => {
-    if (!running) return
+    if (!running && !anyRunning) return
     const interval = setInterval(() => fetchSessions(), 3000)
     return () => clearInterval(interval)
-  }, [running, fetchSessions])
+  }, [running, anyRunning, fetchSessions])
 
   // fetchProjects loads the list of projects from the gateway.
   const fetchProjects = useCallback(async (): Promise<ProjectInfo[]> => {
@@ -751,6 +844,13 @@ export default function App() {
     setActivity(null)
     setApproval(null)
     lastIdRef.current = 0
+    // This tab's run belongs to ONE conversation, and it keeps running while
+    // the user looks elsewhere. Carry its flag into the row it belongs to, so
+    // coming back to that conversation shows the spinner its own turn earned -
+    // the gateway does not know about this tab's view of the list, and the
+    // next fetchSessions would otherwise paint the row idle for a tick.
+    const liveRun = runSessionRef.current
+    if (liveRun) setRunningState(true, liveRun)
     // Load transcript for the new session.
     try {
       const res = await api('/v1/sessions/' + id + '/messages')
@@ -820,6 +920,17 @@ export default function App() {
         const err = await res.json().catch(() => ({}))
         setState(err.error || 'could not delete the session', true)
         return
+      }
+      // Remove the deleted session from the local state IMMEDIATELY, before
+      // the refetch. A 3-second polling interval (or a run's deferred
+      // saveSession resurrecting the file) can slip a stale list in between
+      // the DELETE and fetchSessions, making the session flicker back into
+      // the sidebar. For 200 (default reset) we keep the row but clear its
+      // title locally so the placeholder shows without waiting for the refetch.
+      if (res.status === 204) {
+        setSessions(prev => prev.filter(s => s.id !== id))
+      } else {
+        setSessions(prev => prev.map(s => s.id === id ? { ...s, title: 'New session' } : s))
       }
       const list = await fetchSessions()
       // If we deleted the active session, switch to the most recent remaining one.
@@ -1093,7 +1204,11 @@ export default function App() {
 
   // finish marks the run as done.
   const finish = useCallback(() => {
-    setRunningState(false)
+    // Cleared against the session the run was STARTED in, not against whatever
+    // is on screen now: a user who switched away mid-turn must not have the
+    // finished run's flag land on the conversation they switched to.
+    setRunningState(false, runSessionRef.current || sessionRef.current)
+    runSessionRef.current = ''
     setActivity(null)
     setState('ready')
     // After a run finishes, refresh the session list so the auto-title shows up.
@@ -1209,6 +1324,9 @@ export default function App() {
   // submit sends a task and reads the SSE response.
   const submit = useCallback(async (text: string) => {
     setMessages(prev => [...prev, { id: nextId(), role: 'user', text }])
+    // Pinned BEFORE the run starts, so the spinner and its clearing are both
+    // addressed to the conversation this turn belongs to.
+    runSessionRef.current = sessionRef.current
     setRunningState(true)
     setState('working')
     let res: Response
@@ -1494,7 +1612,20 @@ export default function App() {
   // project-grouped layout and the free-standing list share the same markup.
   // On desktop, action buttons appear on hover. On mobile, long-press opens
   // a context menu with Edit / Delete.
-  const renderSessionRow = (s: SessionInfo) => (
+  const renderSessionRow = (s: SessionInfo) => {
+    // `s.running` is the gateway's own answer about this conversation. The
+    // local run is folded into the LIST at the two moments this tab knows
+    // something the gateway has not said yet (see setRunningState), so a row
+    // never has to reason about which client started what - and a run started
+    // in another tab, by a scheduled task, or restored after a gateway restart
+    // shows up through exactly the same field.
+    //
+    // `answeredHere` masks the one case where the gateway and the user
+    // disagree: the answer has been delivered to this tab but the turn's
+    // goroutine has not returned, so the flag is still true for a moment. See
+    // answeredRef.
+    const busy = s.running && !answeredHere(s.id)
+    return (
     <div
       key={s.id}
       class={`session-row group flex items-center gap-2 px-3 py-2 rounded-lg cursor-pointer transition-colors mb-0.5 ${
@@ -1505,6 +1636,14 @@ export default function App() {
       onTouchMove={cancelLongPress}
       onTouchEnd={cancelLongPress}
     >
+      {/* The activity spinner. It is ALWAYS mounted and absolutely positioned
+          against the row (`.session-spinner`, index.css), so it comes and goes
+          without moving the title, the timestamp or the facts by a pixel: the
+          in-flow version pushed the row's whole content sideways for as long as
+          a run lasted. The class carries the state; the transition and the
+          rotation are plain CSS, because this build disables Tailwind's
+          `animation` plugin and an `animate-spin` icon never turned at all. */}
+      <span class={`session-spinner${busy ? ' is-running' : ''}`} aria-hidden="true" />
       {renamingId === s.id ? (
         <>
           <input
@@ -1539,16 +1678,11 @@ export default function App() {
         </>
       ) : (
         <>
-          {s.running && (
-            <svg class="animate-spin flex-none text-accent self-start mt-1" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-            </svg>
-          )}
           {/* Two lines, so the title keeps the full width and the facts sit
               under it instead of competing for the same row: at a narrow
               sidebar the branch used to squeeze the title away. */}
           <div class="flex-1 min-w-0">
-            <div class={`truncate text-sm leading-tight ${s.running ? 'text-accent' : 'text-[#e8e8ea]'}`}>
+            <div class={`truncate text-sm leading-tight ${busy ? 'text-accent' : 'text-[#e8e8ea]'}`}>
               {s.title || s.id}
             </div>
             {/* When it was last used, on its own line. It was sharing the row
@@ -1706,7 +1840,8 @@ export default function App() {
         </div>
       )}
     </div>
-  )
+    )
+  }
 
   return (
     <div class="app-bg flex h-[100dvh] text-[#e8e8ea] overflow-hidden">

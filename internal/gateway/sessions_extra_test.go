@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/madkoding/motita/internal/config"
 )
@@ -199,49 +201,88 @@ func TestTheDefaultSessionIsResetNotClosed(t *testing.T) {
 	}
 }
 
-// TestASessionWithARunInFlightCannotBeClosed: there is no cancel path in this design, and
-// reporting a closed session while its run is still writing would be a lie about what is
-// happening.
-func TestASessionWithARunInFlightCannotBeClosed(t *testing.T) {
+// TestASessionWithARunInFlightIsClosedByStoppingIt: a run in flight is no longer a
+// reason to refuse. It used to be - there was no cancel path, and reporting a closed
+// session while its run was still writing would have been a lie about what was
+// happening. There IS one now, so the lie is gone and the decision belongs to the
+// user: deleting a conversation stops what is running in it and then removes it.
+func TestASessionWithARunInFlightIsClosedByStoppingIt(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
-	srv := newTestServer(t, &blockingService{fakeService: fakeService{}, started: started, release: release})
-	path := sessionPath(srv, DefaultSession, "/task")
-
-	go func() { _ = post(t, srv, path, `{"task":"x"}`, testToken) }()
-	<-started
-
-	w := deleteReq(t, srv, sessionPath(srv, DefaultSession, ""), testToken)
-	// The default is refused for being the default, so the busy branch is reached through a
-	// conversation that is not the default; both refusals are 409 and the test checks the run
-	// one on a session of its own below.
-	if w.Code != http.StatusConflict {
-		t.Fatalf("closing a session while it runs answered %d, it must be 409", w.Code)
-	}
-	close(release)
-}
-
-// TestASessionWithARunInFlightCannotBeClosedNonDefault drives the busy branch on a conversation
-// that is NOT the default, so the refusal under test is "a run is in flight" and not "this is the
-// default session" - two different rules that happen to share a status code.
-func TestASessionWithARunInFlightCannotBeClosedNonDefault(t *testing.T) {
-	started, release := make(chan struct{}), make(chan struct{})
-	srv := newTestServer(t, &fakeService{}, withFactory())
-	conv, err := srv.newSession(&blockingService{fakeService: fakeService{}, started: started, release: release})
+	svc := &blockingService{fakeService: fakeService{}, started: started, release: release}
+	srv := newTestServer(t, svc, withFactory())
+	conv, err := srv.newSession(svc)
 	if err != nil {
 		t.Fatalf("newSession: %v", err)
 	}
 
-	go func() { _ = post(t, srv, sessionPath(srv, conv.id, "/task"), `{"task":"x"}`, testToken) }()
+	abandon := startInBackground(t, srv, conv.id, "/task", `{"task":"x"}`)
+	defer abandon()
 	<-started
 
 	w := deleteReq(t, srv, sessionPath(srv, conv.id, ""), testToken)
-	if w.Code != http.StatusConflict {
-		t.Fatalf("closing a busy session answered %d, it must be 409", w.Code)
+	// 204: the session is REMOVED. It is not the default, so this is a removal
+	// rather than a reset.
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("closing a session while it runs answered %d, it must be 204: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "run is in progress") {
-		t.Errorf("the refusal must name the run, not the default: %s", w.Body.String())
+	// And the run is stopped, not orphaned: the service saw its context cancelled.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := srv.lookup(conv.id); !ok {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("the session is still registered after being deleted")
+	close(release)
+}
+
+// TestADeletedSessionsRunIsNoLongerExecuting is the same rule stated as the thing
+// that actually matters: after the deletion answers, nothing is still working on
+// behalf of that conversation.
+func TestADeletedSessionsRunIsNoLongerExecuting(t *testing.T) {
+	var stillRunning atomic.Bool
+	stillRunning.Store(true)
+	started, release := make(chan struct{}), make(chan struct{})
+	// The SESSION has to be served by the service that blocks: a plain fakeService
+	// answers instantly, so there would be no run in flight to delete out from under.
+	tracking := &trackingService{started: started, release: release, running: &stillRunning}
+	srv := newTestServer(t, tracking, withFactory())
+	conv, err := srv.newSession(tracking)
+	if err != nil {
+		t.Fatalf("newSession: %v", err)
+	}
+
+	abandon := startInBackground(t, srv, conv.id, "/task", `{"task":"x"}`)
+	defer abandon()
+	<-started
+
+	if w := deleteReq(t, srv, sessionPath(srv, conv.id, ""), testToken); w.Code != http.StatusNoContent {
+		t.Fatalf("delete: %d %s", w.Code, w.Body.String())
+	}
+	if stillRunning.Load() {
+		t.Error("the run was still executing after the session was deleted")
 	}
 	close(release)
+}
+
+// trackingService reports whether its turn is still executing.
+type trackingService struct {
+	fakeService
+	started chan struct{}
+	release chan struct{}
+	running *atomic.Bool
+}
+
+func (s *trackingService) RunTask(ctx context.Context, _ string, _ func(string, ...any)) (string, error) {
+	close(s.started)
+	defer s.running.Store(false)
+	select {
+	case <-s.release:
+		return "released", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 // TestTheListReportsEverySession: a front end has to be able to see what is open, including the

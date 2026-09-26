@@ -486,7 +486,16 @@ func (c *Client) callOpenAI(ctx context.Context, messages []Message) (string, er
 	if len(resp.Choices) == 0 {
 		return "", errors.New("OpenAI returned empty choices")
 	}
-	return resp.Choices[0].Message.Content, nil
+	choice := resp.Choices[0]
+	if strings.TrimSpace(choice.Message.Content) == "" {
+		// An empty content with HTTP 200 is not a success: the model hit a
+		// length limit, was blocked by a content filter, or answered with
+		// tool_calls we cannot honour here. Treat it as a retryable error so
+		// the Complete loop re-asks instead of propagating "" to ExtractJSON,
+		// where it becomes the opaque "the LLM response is empty" failure.
+		return "", fmt.Errorf("OpenAI returned an empty response (finish_reason=%q)", choice.FinishReason)
+	}
+	return choice.Message.Content, nil
 }
 
 func (c *Client) callOpenAITools(ctx context.Context, messages []Message, tools []Tool) (Reply, error) {
@@ -518,6 +527,11 @@ func (c *Client) callOpenAITools(ctx context.Context, messages []Message, tools 
 		return Reply{}, errors.New("OpenAI returned empty choices")
 	}
 	choice := resp.Choices[0]
+	if strings.TrimSpace(choice.Message.Content) == "" && len(choice.Message.ToolCalls) == 0 {
+		// No text and no tool calls: the model produced nothing usable.
+		// Treat it as a retryable error, same rationale as callOpenAI.
+		return Reply{}, fmt.Errorf("OpenAI returned an empty response (finish_reason=%q)", choice.FinishReason)
+	}
 	return Reply{
 		Content:      choice.Message.Content,
 		Calls:        choice.Message.ToolCalls,

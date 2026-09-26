@@ -158,12 +158,33 @@ func (s *Server) handleCreateProject(w http.ResponseWriter, r *http.Request) {
 // handleDeleteProject removes a project. Sessions that belong to it are NOT
 // deleted: they remain, but their project_id becomes a dangling reference,
 // which the front end renders as "no project".
+//
+// Their RUNS are stopped, though - and that is not the same decision. A session
+// that stays behind with no project is still a session the user owns; a turn
+// still executing against a project the user just removed is not. Leaving those
+// running would keep writing into a workspace the user has deliberately let go of,
+// and they are exactly the sessions nobody can reach afterwards, because the panel
+// they were started from is gone.
 func (s *Server) handleDeleteProject(w http.ResponseWriter, r *http.Request) {
 	if s.projects == nil {
 		writeError(w, http.StatusNotImplemented, "this gateway was started without a project directory")
 		return
 	}
 	id := r.PathValue("id")
+	// Stop every run that belongs to this project BEFORE its file is removed,
+	// for the same reason a session deletion stops its own: the run's goroutine
+	// still unwinds and saves. It also means a client that was watching one of
+	// those sessions sees it end rather than freeze.
+	for _, c := range s.snapshot() {
+		if c.projectID != id {
+			continue
+		}
+		if stopped, settled := c.stopRunForDeletion(deleteStopTimeout); stopped && !settled {
+			writeError(w, http.StatusConflict,
+				"a run in one of this project's sessions did not stop in time, so the project was not deleted: stop it and try again")
+			return
+		}
+	}
 	if err := s.projects.delete(id); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
