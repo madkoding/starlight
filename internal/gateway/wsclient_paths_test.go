@@ -352,7 +352,6 @@ func TestAResumedSessionThatIsAlreadyRunningIsReported(t *testing.T) {
 
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
 	srv, sink := startServer(t, Options{
 		Token:        testToken,
 		WorkspaceDir: t.TempDir(),
@@ -368,6 +367,20 @@ func TestAResumedSessionThatIsAlreadyRunningIsReported(t *testing.T) {
 				return "done", nil
 			}}, nil
 		},
+	})
+
+	// Released in a cleanup registered AFTER startServer, and then WAITED for - the
+	// same fix, for the same reason, as the twin of this test in server_paths_test.go.
+	//
+	// The task blocks on release and ignores its context, so srv.Close does not end it.
+	// With the cleanup registered before startServer it ran after the close, and the
+	// run's goroutine was then free to finish later and write (its deferred
+	// saveSession) into the sessions directory while t.TempDir's cleanup removed it.
+	// Waiting for the conversation to stop running is what removes the race:
+	// isRunning is false only after releaseRunSlot, the goroutine's last defer.
+	t.Cleanup(func() {
+		close(release)
+		waitForNoRun(t, srv)
 	})
 
 	if _, ok := srv.lookup("s-busy"); !ok {

@@ -29,6 +29,44 @@ func (s *stuckService) RunTask(ctx context.Context, _ string, _ func(string, ...
 	return "finally released", nil
 }
 
+// newStuckServer returns a server whose service refuses to stop, with a session
+// factory so a session of its own can be created and served by the same service.
+//
+// It also shrinks the deletion's wait: reaching the real ten-second timeout would
+// make every test that uses it a ten-second test, and that is the reason the branch
+// went unexercised to begin with.
+func newStuckServer(t *testing.T) (*Server, *stuckService) {
+	t.Helper()
+	svc := &stuckService{started: make(chan struct{}), release: make(chan struct{})}
+	srv := newTestServer(t, svc, func(o *Options) {
+		o.SessionDir = t.TempDir()
+		o.NewService = func() (Service, error) { return svc, nil }
+	})
+	// Released at the end, so the goroutine does not outlive the test - but only at
+	// the end, so the run is still stuck while the deletion is refused.
+	//
+	// And then WAITED for. Releasing it is not enough: the run then finishes normally
+	// and its goroutine still generates an auto-title and saves the session, a write
+	// that would race t.TempDir's RemoveAll. waitForNoRun makes the temp dirs quiet
+	// before they are removed - isRunning is false only after the goroutine's last
+	// defer.
+	t.Cleanup(func() {
+		close(svc.release)
+		waitForNoRun(t, srv)
+	})
+	shrinkDeleteStopTimeout(t)
+	return srv, svc
+}
+
+// shrinkDeleteStopTimeout makes the deletion's wait short for one test and restores
+// it afterwards.
+func shrinkDeleteStopTimeout(t *testing.T) {
+	t.Helper()
+	prev := deleteStopTimeout
+	deleteStopTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { deleteStopTimeout = prev })
+}
+
 // TestStopRunForDeletionReportsNothingToStop: stopping a conversation with no run is
 // not an error and not a wait - it reports that there was nothing to stop, and
 // settled is true so the caller can go on and delete. This is the common case: most
@@ -44,12 +82,37 @@ func TestStopRunForDeletionReportsNothingToStop(t *testing.T) {
 	}
 }
 
+// TestStopRunForDeletionStopsAnHonestRun: the ordinary case, and the one the whole
+// feature is for - a run that is in flight and behaving is stopped, and the wait
+// returns as soon as it has settled.
+func TestStopRunForDeletionStopsAnHonestRun(t *testing.T) {
+	var sawCancel atomic.Bool
+	srv := newTestServer(t, &fakeService{task: func(ctx context.Context, _ string, _ func(string, ...any)) (string, error) {
+		<-ctx.Done()
+		sawCancel.Store(true)
+		return "", ctx.Err()
+	}})
+	conv, _ := srv.lookup(DefaultSession)
+
+	abandon := startInBackground(t, srv, DefaultSession, "/task", `{"task":"work"}`)
+	defer abandon()
+	waitForRunning(t, srv, DefaultSession)
+
+	stopped, settled := conv.stopRunForDeletion(5 * time.Second)
+	if !stopped || !settled {
+		t.Fatalf("an honest run was reported as stopped=%v settled=%v, want true/true", stopped, settled)
+	}
+	if !sawCancel.Load() {
+		t.Error("the run was reported as stopped but never saw its cancellation")
+	}
+}
+
 // TestStopRunForDeletionTimesOutOnAStuckRun: the wait is BOUNDED.
 //
 // A run that ignores its cancellation must not hold the request open forever, and it
 // must not let the session be deleted behind a turn that is still writing. It is
-// reported as stopped-on-paper (stopped, not settled) and the handler turns that
-// into a 409 that says so - the user is told the truth and can try again.
+// reported as stopped-on-paper (stopped, not settled) and the handler turns that into
+// a refusal that says so - the user is told the truth instead of being left waiting.
 func TestStopRunForDeletionTimesOutOnAStuckRun(t *testing.T) {
 	srv, svc := newStuckServer(t)
 	conv, ok := srv.lookup(DefaultSession)
@@ -96,69 +159,8 @@ func TestDeletingASessionWhoseRunWillNotStopIsRefused(t *testing.T) {
 	}
 }
 
-// newStuckServer returns a server whose service refuses to stop, with a session
-// factory so a session of its own can be created and served by the same service.
-func newStuckServer(t *testing.T) (*Server, *stuckService) {
-	t.Helper()
-	svc := &stuckService{started: make(chan struct{}), release: make(chan struct{})}
-	srv := newTestServer(t, svc, func(o *Options) {
-		o.SessionDir = t.TempDir()
-		o.NewService = func() (Service, error) { return svc, nil }
-	})
-	// Released at the end, so the goroutine does not outlive the test - but only
-	// at the end, so the run is still stuck while the deletion is refused.
-	//
-	// And then WAITED for. Releasing it is not enough: the run then finishes
-	// normally and its goroutine still generates an auto-title and saves the
-	// session, so that write races t.TempDir's RemoveAll exactly the way the
-	// pre-existing flake in server_paths_test.go did. Waiting for the conversation
-	// to stop running is what makes the temp dirs quiet before they are removed -
-	// isRunning is false only after the goroutine's last defer.
-	t.Cleanup(func() {
-		close(svc.release)
-		waitForNoRun(t, srv)
-	})
-	shrinkDeleteStopTimeout(t)
-	return srv, svc
-}
-
-// waitForNoRun blocks until no conversation on the server is running.
-//
-// It exists so a test's temp directories are quiet before t.TempDir's cleanup removes
-// them: a run that has just been released still writes, and that write racing RemoveAll
-// is a flake that fails about one run in twenty under load.
-func waitForNoRun(t *testing.T, srv *Server) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		running := false
-		for _, c := range srv.snapshot() {
-			if c.isRunning() {
-				running = true
-			}
-		}
-		if !running {
-			return
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Error("a run never finished, so its writer can still race the temp dir")
-}
-
-// shrinkDeleteStopTimeout makes the deletion's wait short for one test and restores
-// it afterwards.
-//
-// Without this the timeout branch can only be reached by a ten-second test, which
-// is the reason it went unexercised to begin with.
-func shrinkDeleteStopTimeout(t *testing.T) {
-	t.Helper()
-	prev := deleteStopTimeout
-	deleteStopTimeout = 50 * time.Millisecond
-	t.Cleanup(func() { deleteStopTimeout = prev })
-}
-
 // TestDeletingAProjectWhoseRunWillNotStopIsRefused: the project handler's half. The
-// project must survive, and nothing about it must be removed.
+// project must survive, and it must still be listed.
 func TestDeletingAProjectWhoseRunWillNotStopIsRefused(t *testing.T) {
 	svc := &stuckService{started: make(chan struct{}), release: make(chan struct{})}
 	srv := newTestServer(t, svc, func(o *Options) {
@@ -207,29 +209,5 @@ func TestDeletingAProjectWhoseRunWillNotStopIsRefused(t *testing.T) {
 	// The project is still there.
 	if w := get(t, srv, "/v1/projects", testToken); !strings.Contains(w.Body.String(), p.ID) {
 		t.Errorf("the project was removed even though its run had not stopped: %s", w.Body.String())
-	}
-}
-
-// TestStopRunForDeletionStopsAnHonestRun: the ordinary case, and the one the whole
-// feature is for - a run that is in flight, behaving, is stopped and settled.
-func TestStopRunForDeletionStopsAnHonestRun(t *testing.T) {
-	var sawCancel atomic.Bool
-	srv := newTestServer(t, &fakeService{task: func(ctx context.Context, _ string, _ func(string, ...any)) (string, error) {
-		<-ctx.Done()
-		sawCancel.Store(true)
-		return "", ctx.Err()
-	}})
-	conv, _ := srv.lookup(DefaultSession)
-
-	abandon := startInBackground(t, srv, DefaultSession, "/task", `{"task":"work"}`)
-	defer abandon()
-	waitForRunning(t, srv, DefaultSession)
-
-	stopped, settled := conv.stopRunForDeletion(5 * time.Second)
-	if !stopped || !settled {
-		t.Fatalf("an honest run was reported as stopped=%v settled=%v, want true/true", stopped, settled)
-	}
-	if !sawCancel.Load() {
-		t.Error("the run was reported as stopped but never saw its cancellation")
 	}
 }

@@ -154,6 +154,29 @@ func newTestServer(t *testing.T, svc Service, mutators ...func(*Options)) *Serve
 	return srv
 }
 
+// waitForNoRun blocks until no conversation on the server is running.
+//
+// It exists so a test's temp directories are quiet before t.TempDir's cleanup removes
+// them: a run that has just been released still writes, and that write racing RemoveAll
+// is a flake that fails about one run in twenty under load.
+func waitForNoRun(t *testing.T, srv *Server) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		running := false
+		for _, c := range srv.snapshot() {
+			if c.isRunning() {
+				running = true
+			}
+		}
+		if !running {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Error("a run never finished, so its writer can still race the temp dir")
+}
+
 // get performs a request against the server and returns the recorder.
 func get(t *testing.T, srv *Server, path, token string) *httptest.ResponseRecorder {
 	t.Helper()
